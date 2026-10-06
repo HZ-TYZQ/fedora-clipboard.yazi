@@ -33,15 +33,25 @@ ln -s "$PWD/fedora-clipboard.yazi" ~/.config/yazi/plugins/fedora-clipboard.yazi
 
 ## 配置
 
-`~/.config/yazi/init.lua`（必需，负责 yazi → 系统剪贴板方向）：
+`~/.config/yazi/init.lua`：
 
 ```lua
 require("fedora-clipboard"):setup()
 ```
 
-`~/.config/yazi/keymap.toml`（负责系统剪贴板 → yazi 方向）：
+`~/.config/yazi/keymap.toml`：
 
 ```toml
+[[mgr.prepend_keymap]]
+on   = "y"
+run  = [ "yank", "plugin fedora-clipboard push" ]
+desc = "Yank selected files (copy) and sync to the system clipboard"
+
+[[mgr.prepend_keymap]]
+on   = "x"
+run  = [ "yank --cut", "plugin fedora-clipboard push" ]
+desc = "Yank selected files (cut) and sync to the system clipboard"
+
 [[mgr.prepend_keymap]]
 on   = "p"
 run  = "plugin fedora-clipboard paste"
@@ -53,7 +63,10 @@ run  = "plugin fedora-clipboard 'paste --force'"
 desc = "Paste from the system clipboard or yanked files (overwrite)"
 ```
 
-`paste` 支持与 yazi 内置 `paste` 动作相同的 `--force`、`--follow` 参数。
+- `push`：把刚刚 yank 的文件写入系统剪贴板，必须紧跟在 `yank` 之后执行。
+  其他执行 `yank` 的自定义键位，也要在后面追加 `plugin fedora-clipboard push`。
+- `paste`：支持与 yazi 内置 `paste` 动作相同的 `--force`、`--follow` 参数。
+- `setup()` 负责在 yank 列表因取消、删除、改名而变化时，跟随更新或释放剪贴板。
 
 ### 选项
 
@@ -67,13 +80,14 @@ require("fedora-clipboard"):setup {
 
 | 操作 | 结果 |
 | --- | --- |
-| yazi 中 `y` / `x` | 写入系统剪贴板（复制 / 剪切） |
+| yazi 中 `y` / `x`（经 `push`） | 写入系统剪贴板（复制 / 剪切），总是接管剪贴板 |
 | yazi 中取消 yank（`Y`、`X`），或剪切后已粘贴 | 若剪贴板仍由本 yazi 持有，则清空 |
 | 被 yank 的文件被删除或改名 | 若剪贴板仍由本 yazi 持有，则更新为剩余文件；否则不动，不会抢回剪贴板 |
-| yazi 中 `p`，剪贴板里有本地文件且与 yazi 的 yank 不同 | 以系统剪贴板为准粘贴；若是剪切，则移动并清空剪贴板 |
-| yazi 中 `p`，其他情况 | 执行 yazi 原生 `paste` |
+| yazi 中 `p`，剪贴板里有本地文件且与 yazi 的 yank 不同 | 以系统剪贴板为准粘贴；若是剪切，则移动并清空剪贴板。若刚 yank 的内容还没写进剪贴板，会先等它写完 |
+| yazi 中 `p`，其他情况 | 粘贴 yazi 自己的 yank，效果与原生 `paste` 相同 |
 
 “以最后一次复制为准”：无论是在 yazi 还是在其他程序里复制，`p` 粘贴的都是最近一次复制的文件。
+粘贴目标始终是按下 `p` 时所在的目录，即使在等待剪贴板期间切换了目录或标签页。
 
 写入剪贴板的格式：
 
@@ -91,9 +105,11 @@ Dolphin 与 Nautilus 各自只认自己的剪切标记，互相粘贴时剪切�
 
 ## 工作原理
 
-- yazi 的 `@yank` 事件触发后，插件读取 yank 列表，交给内嵌的 Python 辅助程序。
+- `push` 读取 yank 列表，交给内嵌的 Python 辅助程序。
   它通过 Wayland data-control 协议成为剪贴板的持有者，然后脱离 yazi 在后台运行，按需向粘贴方提供数据；
   一旦其他程序接管剪贴板就自动退出。因此退出 yazi 后剪贴板内容依然有效。
+- yazi 的 `@yank` 事件不区分“用户 yank”和“文件被删除、改名导致 yank 列表变化”，
+  所以主动复制由键位里显式的 `push` 表达，`@yank` 只用于被动跟随：仅当剪贴板仍由本插件的后台进程持有时才更新或释放。
 - `wl-copy` 每次只能提供一种 MIME 类型，无法同时满足 GNOME 和 KDE，这是自带辅助程序的原因。
 - Flatpak 应用在沙箱里看不到 `text/uri-list` 中的大多数路径。辅助程序会像 Dolphin 一样，
   通过 D-Bus 把文件登记到 xdg-desktop-portal 的文档门户（`org.freedesktop.portal.FileTransfer`），

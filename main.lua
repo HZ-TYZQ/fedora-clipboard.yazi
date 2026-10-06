@@ -1,4 +1,5 @@
 --- @since 26.8.15
+--- @sync entry
 
 -- MIME types understood by GNOME Files (Nautilus) and Dolphin, see docs/research.md
 local GNOME = "x-special/gnome-copied-files"
@@ -163,33 +164,19 @@ end
 
 local function same(a, b) return a.cut == b.cut and #a.paths == #b.paths and #difference(a, b) == 0 end
 
-local function vanished(paths)
-	for _, path in ipairs(paths) do
-		if fs.cha(Url(path)) then
-			return false
-		end
-	end
-	return true
-end
-
 -- Offer `want.items` on the clipboard, or give up our ownership of it if `want` is false
 local function write(st, want)
 	if not want then
 		local pid = st.pid
 		st.pid = nil
 		return not pid or helper(st, { "release", pid })
-	end
-
-	-- Yanked files were deleted or renamed rather than yanked by the user: follow along only
-	-- while the clipboard is still ours, instead of taking it back from whichever app owns it now
-	local passive = want.dropped and vanished(want.dropped)
-	if passive and not st.pid then
+	elseif not want.active and not st.pid then
 		return true
 	end
 
 	if not st.fallback then
 		local json = ya.json_encode { items = want.items, uris = want.uris }
-		local out, code, err = helper(st, { "copy", passive and st.pid or nil }, json)
+		local out, code, err = helper(st, { "copy", not want.active and st.pid or nil }, json)
 		if out then
 			st.pid = out:match("%d+")
 			return true
@@ -201,7 +188,7 @@ local function write(st, want)
 	return Fallback.copy(want.items)
 end
 
--- Serialize clipboard writes so that the latest yank always wins
+-- Serialize clipboard writes so that the latest one always wins
 local function flush(st)
 	while st.want ~= nil do
 		local want = st.want
@@ -215,15 +202,21 @@ local function flush(st)
 	st.busy = false
 end
 
-local function sync_yanked(st)
-	local s, prev = snapshot(), st.prev
-	st.prev = s
+-- An active sync comes from the user yanking, and always takes over the clipboard. Any other change
+-- to the yank list (unyank, or yanked files being deleted or renamed) only updates the clipboard
+-- while it is still ours, instead of taking it back from whichever app owns it now.
+local function sync_yanked(st, active)
+	local s = snapshot()
+	if not active and st.last and same(s, st.last) then
+		return
+	end
+
+	st.last = s
 	if #s.paths == 0 then
 		st.want = false
 	else
 		local items, uris = offers(s.paths, s.cut)
-		local shrunk = prev and s.cut == prev.cut and #s.paths < #prev.paths and #difference(s, prev) == 0
-		st.want = { items = items, uris = uris, dropped = shrunk and difference(prev, s) or nil }
+		st.want = { items = items, uris = uris, active = active or (st.want and st.want.active) }
 	end
 
 	if not st.busy then
@@ -232,17 +225,9 @@ local function sync_yanked(st)
 	end
 end
 
-local state = ya.sync(function(st)
-	local s = snapshot()
-	s.cwd, s.python, s.fallback = cx.active.current.cwd, st.python, st.fallback
-	return s
-end)
-
-local reset_behavior = ya.sync(function() cx.tasks.behavior:reset() end)
-
-local function read(s)
-	if not s.fallback then
-		local out, code, err = helper(s, { "paste", GNOME, URI_LIST, KDE_CUT })
+local function read(st)
+	if not st.fallback then
+		local out, code, err = helper(st, { "paste", GNOME, URI_LIST, KDE_CUT })
 		if out then
 			return (ya.json_decode(out) or {}).data
 		elseif code ~= 2 then
@@ -252,9 +237,9 @@ local function read(s)
 	return Fallback.paste()
 end
 
-local function clear(s)
-	if not s.fallback then
-		local _, code = helper(s, { "clear" })
+local function clear(st)
+	if not st.fallback then
+		local _, code = helper(st, { "clear" })
 		if code ~= 2 then
 			return
 		end
@@ -262,46 +247,70 @@ local function clear(s)
 	Fallback.clear()
 end
 
-local function paste(job)
-	local s = state()
-	local data, code, err = read(s)
-	if not data then
-		return notify(string.format("Failed to read the clipboard (%s):\n%s", code, err))
-	end
-
-	local opts = { force = job.args.force, follow = job.args.follow }
-	local clip = parse(data)
-
-	-- Yazi's own yank is still what the clipboard holds, or the clipboard can't represent it
-	if not clip or s.foreign or same(clip, s) then
-		return ya.emit("paste", opts)
-	end
-
-	reset_behavior()
-	local kind = clip.cut and "move" or "copy"
-	for _, path in ipairs(clip.paths) do
+-- Copy or move `src.paths` into the directory `cwd`
+local function paste_files(src, cwd, opts)
+	local kind = src.cut and "move" or "copy"
+	for _, path in ipairs(src.paths) do
 		local from = Url(path)
-		local to = from.name and s.cwd:join(from.name)
-		if to and not (from == to and (clip.cut or opts.force)) then
+		local to = from.name and cwd:join(from.name)
+		if to and not (from == to and (src.cut or opts.force)) then
 			ya.task(kind, { from = from, to = to, force = opts.force, follow = opts.follow }):spawn()
 		end
 	end
+end
 
-	-- Like Nautilus, a cut can only be pasted once
-	if clip.cut then
-		clear(s)
+-- Runs in an async block. `s` is the snapshot taken when `p` was pressed, and everything goes into
+-- `s.cwd`: Yazi's own `paste` would use wherever the user has moved to by the time this gets there.
+local function paste(st, opts, s)
+	-- Pending yanks must reach the clipboard first, or its old content would look newer than them
+	for _ = 1, 100 do
+		if not st.busy then
+			break
+		end
+		ya.sleep(0.05)
+	end
+
+	local clip
+	if not st.busy then
+		local data, code, err = read(st)
+		if not data then
+			return notify(string.format("Failed to read the clipboard (%s):\n%s", code, err))
+		end
+		clip = parse(data)
+	end
+
+	-- The clipboard holds no files, Yazi's own yank, or is still being written: paste the yank
+	if not clip or same(clip, s) then
+		paste_files(s, s.cwd, opts)
+		if s.cut and (not st.last or same(st.last, s)) then
+			ya.emit("unyank", {})
+		end
+	else
+		paste_files(clip, s.cwd, opts)
+		if clip.cut then
+			clear(st) -- Like Nautilus, a cut can only be pasted once
+		end
 	end
 end
 
 function M:setup(opts)
 	self.python = opts and opts.python or "python3"
-	ps.sub("@yank", function() sync_yanked(self) end)
+	ps.sub("@yank", function() sync_yanked(self, false) end)
 end
 
 function M:entry(job)
 	local action = job.args[1] or "paste"
-	if action == "paste" then
-		paste(job)
+	if action == "push" then
+		sync_yanked(self, true)
+	elseif action == "paste" then
+		local s, opts = snapshot(), { force = job.args.force, follow = job.args.follow }
+		if s.foreign then
+			return ya.emit("paste", opts) -- The clipboard can't hold these, no need to wait for it
+		end
+
+		s.cwd = cx.active.current.cwd
+		cx.tasks.behavior:reset()
+		ya.async(paste, self, opts, s)
 	else
 		notify(string.format("Unknown action `%s`", action))
 	end
