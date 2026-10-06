@@ -146,7 +146,15 @@ function Fallback.paste()
 	return data
 end
 
-function Fallback.clear() return exec("wl-copy", { "--clear" }) end
+-- Whether two results of reading the clipboard hold the same files
+local function same_data(a, b) return a[GNOME] == b[GNOME] and a[URI_LIST] == b[URI_LIST] and a[KDE_CUT] == b[KDE_CUT] end
+
+function Fallback.clear(expected)
+	local data = Fallback.paste()
+	if data and same_data(data, expected) then
+		exec("wl-copy", { "--clear" })
+	end
+end
 
 -- Paths of `a` that are not in `b`
 local function difference(a, b)
@@ -168,7 +176,7 @@ local function same(a, b) return a.cut == b.cut and #a.paths == #b.paths and #di
 local function write(st, want)
 	if not want then
 		local pid = st.pid
-		st.pid = nil
+		st.pid, st.stale = nil, nil
 		return not pid or helper(st, { "release", pid })
 	elseif not want.active and not st.pid then
 		return true
@@ -188,6 +196,18 @@ local function write(st, want)
 	return Fallback.copy(want.items)
 end
 
+local function read(st)
+	if not st.fallback then
+		local out, code, err = helper(st, { "paste", GNOME, URI_LIST, KDE_CUT })
+		if out then
+			return (ya.json_decode(out) or {}).data
+		elseif code ~= 2 then
+			return nil, code, err
+		end
+	end
+	return Fallback.paste()
+end
+
 -- Serialize clipboard writes so that the latest one always wins
 local function flush(st)
 	while st.want ~= nil do
@@ -197,6 +217,12 @@ local function flush(st)
 		local ok, out, code, err = pcall(write, st, want)
 		if not ok or not out then
 			notify(string.format("Failed to sync the clipboard (%s):\n%s", code, ok and err or out))
+		end
+
+		-- A yank that didn't make it leaves the clipboard older than it: remember what the clipboard held,
+		-- so a paste can tell whether another app has copied something since
+		if want and want.active then
+			st.stale = not (ok and out) and { data = read(st) } or nil
 		end
 	end
 	st.busy = false
@@ -225,26 +251,15 @@ local function sync_yanked(st, active)
 	end
 end
 
-local function read(st)
+-- Clear the clipboard, but only if it still holds `expected`, which was read from it
+local function clear(st, expected)
 	if not st.fallback then
-		local out, code, err = helper(st, { "paste", GNOME, URI_LIST, KDE_CUT })
-		if out then
-			return (ya.json_decode(out) or {}).data
-		elseif code ~= 2 then
-			return nil, code, err
-		end
-	end
-	return Fallback.paste()
-end
-
-local function clear(st)
-	if not st.fallback then
-		local _, code = helper(st, { "clear" })
+		local _, code = helper(st, { "clear" }, ya.json_encode(expected))
 		if code ~= 2 then
 			return
 		end
 	end
-	Fallback.clear()
+	Fallback.clear(expected)
 end
 
 -- Copy or move `src.paths` into the directory `cwd`
@@ -270,13 +285,18 @@ local function paste(st, opts, s)
 		ya.sleep(0.05)
 	end
 
-	local clip
+	local clip, data
 	if not st.busy then
-		local data, code, err = read(st)
+		local code, err
+		data, code, err = read(st)
 		if not data then
 			return notify(string.format("Failed to read the clipboard (%s):\n%s", code, err))
+		elseif st.stale and not st.stale.data then
+			-- The first successful read establishes a baseline; it may still be older than our yank.
+			st.stale.data = data
+		elseif not st.stale or not same_data(st.stale.data, data) then
+			st.stale, clip = nil, parse(data)
 		end
-		clip = parse(data)
 	end
 
 	-- The clipboard holds no files, Yazi's own yank, or is still being written: paste the yank
@@ -288,7 +308,7 @@ local function paste(st, opts, s)
 	else
 		paste_files(clip, s.cwd, opts)
 		if clip.cut then
-			clear(st) -- Like Nautilus, a cut can only be pasted once
+			clear(st, data) -- Like Nautilus, a cut can only be pasted once
 		end
 	end
 end
@@ -321,19 +341,24 @@ HELPER = [==[
 #   copy [PID]      read {"items": [[mime, text], ...], "uris": [...]} JSON from stdin, own the clipboard,
 #                   print daemon PID; with PID, do nothing unless that daemon of ours still owns the clipboard
 #   paste MIME...   print {"types": [...], "data": {mime: text}} for the current clipboard
-#   clear           clear the clipboard
+#   clear           clear the clipboard; given {mime: text} JSON on stdin, only if it still holds exactly that
 #   release PID     stop our daemon PID (clears the clipboard if it still owns it)
 # Exit status 2 means no Wayland data-control protocol is available.
 import json, os, select, signal, socket, struct, sys, threading
 from urllib.parse import unquote_to_bytes
 
 MARKER = "fedora-clipboard.yazi helper"
+OWNER_TYPE = "application/x-fedora-clipboard-yazi"  # Offered by each daemon, with its PID as the data
 MANAGERS = ("ext_data_control_manager_v1", "zwlr_data_control_manager_v1")
 PORTAL_TYPES = ("application/vnd.portal.filetransfer", "application/vnd.portal.files")
 FILE_TRANSFER = ("org.freedesktop.portal.Documents", "/org/freedesktop/portal/documents", "org.freedesktop.portal.FileTransfer")
 
 
 class Unsupported(Exception):
+    pass
+
+
+class Superseded(Exception):
     pass
 
 
@@ -476,12 +501,23 @@ class Clipboard:
                 chunks.append(chunk)
         return b"".join(chunks).decode(errors="replace")
 
-    def offer(self, items):
+    # With `owner`, take over only if that daemon still holds the clipboard right before doing so,
+    # since it may have lost it to another app during our slow setup
+    def offer(self, items, owner=None):
         data = {mime: text.encode() for mime, text in items}
+        data[OWNER_TYPE] = str(os.getpid()).encode()
         source = self.new(lambda op, r: self.on_source(data, op, r))
         self.send(self.manager, 0, u32(source))  # create_data_source
         for mime in data:
             self.send(source, 0, string(mime))  # offer
+        if owner:
+            self.roundtrip()
+            selection = self.selection
+            if OWNER_TYPE not in self.types() or self.receive(OWNER_TYPE) != str(owner):
+                raise Superseded
+            self.roundtrip()
+            if self.selection != selection:
+                raise Superseded
         self.send(self.device, 0, u32(source))  # set_selection
         self.roundtrip()
 
@@ -492,7 +528,15 @@ class Clipboard:
         elif opcode == 1:  # cancelled
             raise EOFError("the selection was taken over")
 
-    def clear(self):
+    # With `expected`, clear only if the clipboard still holds exactly that, and didn't change while reading it
+    def clear(self, expected=None):
+        if expected is not None:
+            selection = self.selection
+            if {m: self.receive(m) for m in expected if m in self.types()} != expected:
+                return
+            self.roundtrip()
+            if self.selection != selection:
+                return
         self.send(self.device, 0, u32(0))  # set_selection(null)
         self.roundtrip()
 
@@ -680,6 +724,8 @@ def copy(owner=None):
         if status == b"ok":
             print(pid)
             return 0
+        elif status == b"superseded":
+            return 0
         sys.stderr.write(status[1:].decode(errors="replace") or "the clipboard daemon died")
         return int(status[:1] or b"1")
 
@@ -697,7 +743,10 @@ def copy(owner=None):
             items += [[mime, key] for mime in PORTAL_TYPES]
         except Exception:
             pass  # Without the portal, only sandboxed apps miss out
-        clipboard.offer(items)
+        clipboard.offer(items, owner)
+    except Superseded:
+        os.write(w, b"superseded")
+        os._exit(0)
     except Unsupported as e:
         os.write(w, b"2" + str(e).encode())
         os._exit(2)
@@ -745,7 +794,7 @@ def main(cmd, *args):
     elif cmd == "paste":
         return paste(args)
     elif cmd == "clear":
-        Clipboard().clear()
+        Clipboard().clear(json.loads(sys.stdin.read() or "null"))
         return 0
     elif cmd == "release":
         return release(args[0])

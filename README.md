@@ -98,6 +98,7 @@ require("fedora-clipboard"):setup {
 | `application/x-kde-cutselection` | 剪切时为 `1` | Dolphin 等 KDE 程序 |
 | `text/plain`、`text/plain;charset=utf-8`、`UTF8_STRING` | 每行一个路径 | 文本编辑器、终端 |
 | `application/vnd.portal.filetransfer`、`application/vnd.portal.files` | 文档门户的传输 key | Flatpak 沙箱应用（如 Flatpak 版 Chrome） |
+| `application/x-fedora-clipboard-yazi` | 后台进程的 PID | 插件自身，用来确认剪贴板是否仍归它所有 |
 
 Dolphin 与 Nautilus 各自只认自己的剪切标记，互相粘贴时剪切会变成复制；
 本插件同时提供两种标记，所以经过 yazi 中转不会丢失剪切语义。
