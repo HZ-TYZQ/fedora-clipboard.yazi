@@ -497,7 +497,12 @@ class Clipboard:
             os.close(w)
         chunks = []
         with os.fdopen(r, "rb") as f:
-            while select.select([f], [], [], timeout)[0] and (chunk := os.read(f.fileno(), 65536)):
+            while True:
+                if not select.select([f], [], [], timeout)[0]:
+                    raise TimeoutError(f"timed out reading clipboard type {mime}")
+                chunk = os.read(f.fileno(), 65536)
+                if not chunk:
+                    break
                 chunks.append(chunk)
         return b"".join(chunks).decode(errors="replace")
 

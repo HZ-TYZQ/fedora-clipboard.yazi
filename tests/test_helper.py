@@ -1,8 +1,11 @@
 """Exercise the embedded helper with real pipes and simulated Wayland events."""
+from contextlib import redirect_stdout
+import io
 import os
 from pathlib import Path
 import struct
 import unittest
+from unittest.mock import patch
 
 
 source = (Path(__file__).resolve().parents[1] / "main.lua").read_text()
@@ -15,6 +18,44 @@ Superseded = namespace["Superseded"]
 OWNER = namespace["OWNER_TYPE"]
 GNOME = "x-special/gnome-copied-files"
 EXPECTED = {GNOME: "cut\nfile:///old.txt"}
+
+
+class ReceiveTests(unittest.TestCase):
+    def source(self, payload, *, stalled=False):
+        clipboard = Clipboard.__new__(Clipboard)
+        clipboard.selection = 10
+        clipboard.offers = {10: [GNOME]}
+
+        def send(obj, opcode, *args, fd=None):
+            if stalled:
+                # Keep the source's write end open after its initial data.
+                self.addCleanup(os.close, os.dup(fd))
+            os.write(fd, payload)
+
+        clipboard.send = send
+        return clipboard
+
+    def test_receive_rejects_timeout_with_or_without_partial_data(self):
+        for payload in (b"", b"cut\nfile:///external/report"):
+            with self.subTest(payload=payload):
+                clipboard = self.source(payload, stalled=True)
+                with self.assertRaises(TimeoutError):
+                    clipboard.receive(GNOME, timeout=0.01)
+
+    def test_receive_accepts_eof_with_or_without_data(self):
+        for payload in (b"", b"cut\nfile:///external/report.txt"):
+            with self.subTest(payload=payload):
+                clipboard = self.source(payload)
+                self.assertEqual(clipboard.receive(GNOME, timeout=0.01), payload.decode())
+
+    def test_paste_does_not_emit_partial_clipboard_data(self):
+        clipboard = self.source(b"cut\nfile:///external/report", stalled=True)
+        clipboard.receive = lambda mime: Clipboard.receive(clipboard, mime, timeout=0.01)
+        output = io.StringIO()
+        with patch.dict(namespace, Clipboard=lambda: clipboard), redirect_stdout(output):
+            with self.assertRaises(TimeoutError):
+                namespace["paste"]([GNOME])
+        self.assertEqual(output.getvalue(), "")
 
 
 class Transport(Clipboard):
