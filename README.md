@@ -20,18 +20,15 @@
 
 ## 安装
 
-yazi 要求插件名为 kebab-case，所以插件目录必须叫 `fedora-clipboard.yazi`（不能用下划线）。
-
-本地安装：
-
 ```sh
-ln -s /path/to/this/repo ~/.config/yazi/plugins/fedora-clipboard.yazi
+ya pkg add HZ-TYZQ/fedora-clipboard
 ```
 
-或者把仓库命名为 `fedora-clipboard.yazi` 发布到 GitHub 后：
+或者从本地克隆安装（插件目录必须叫 `fedora-clipboard.yazi`，yazi 要求插件名为 kebab-case）：
 
 ```sh
-ya pkg add <your-name>/fedora-clipboard
+git clone https://github.com/HZ-TYZQ/fedora-clipboard.yazi.git
+ln -s "$PWD/fedora-clipboard.yazi" ~/.config/yazi/plugins/fedora-clipboard.yazi
 ```
 
 ## 配置
